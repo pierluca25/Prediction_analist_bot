@@ -1,499 +1,336 @@
 """
-Prediction_Bot — Sistema di value betting con scalate a 3 step.
+Prediction_Bot — interfaccia Telegram.
 
-Uso:
-  python bot.py
+Filosofia: il bot fa il lavoro lungo (scaricare, stimare, confrontare),
+l'utente fa il lavoro corto (mandare una riga di quote).
 
-Variabili di ambiente:
-  TELEGRAM_TOKEN — token del bot
-  DATABASE_PATH — percorso del database SQLite (default: ./bot.db)
+Comandi:
+  /oggi              partite in programma, gia' analizzate
+  /stato             bankroll e storico
+  /reset             azzera il conto
+
+Inserimento quote in UN SOLO messaggio:
+  3 2.45 3.20 1.80   -> partita 3, quote Sisal per 1, X, 2
+  3 1 2.45           -> partita 3, solo l'esito 1 a quota 2.45
+  3 O25 1.85         -> partita 3, Over 2.5 a quota 1.85
+
+Il riferimento e' Betfair Exchange, non il modello: il backtest su 8
+stagioni di Serie A ha mostrato che il modello NON batte il mercato.
+Il modello resta visibile come secondo parere, con peso zero sulle decisioni.
 """
 
-import os
-import sqlite3
-import json
-from datetime import datetime, timedelta
-from decimal import Decimal
+from __future__ import annotations
 
-import numpy as np
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import logging
+import os
+import re
+import sqlite3
+from datetime import datetime
+
+from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
-    ContextTypes,
-    ConversationHandler,
 )
 
-# ========== CONFIG ==========
-TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
-DB_PATH = os.getenv("DATABASE_PATH", "./bot.db")
-CAPITALE_INIZIALE = 300.0
-COSTO_ORA = 9.0
+import engine as E
 
-# Stati della conversation
-ATTESA_PARTITA, ATTESA_QUOTE_H, ATTESA_QUOTE_D, ATTESA_QUOTE_A = range(4)
-ATTESA_QUOTE_O25, ATTESA_QUOTE_U25, ATTESA_QUOTE_BTTS, ATTESA_SCALATA = range(4, 8)
-ATTESA_RISULTATO_PARTITA, ATTESA_RISULTATO_ESITO = range(8, 10)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("prediction_bot")
 
+TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+DB_PATH = os.getenv("DATABASE_PATH", "/tmp/prediction_bot.db")
+CAPITALE_DEFAULT = float(os.getenv("CAPITALE", "300"))
 
-def devig_power(odds):
-    """Devigging metodo power."""
-    q = np.array([1.0 / o for o in odds], dtype=float)
-    s = q.sum()
-    if abs(s - 1.0) < 1e-9:
-        return q
-    from scipy.optimize import brentq
-
-    def f(k):
-        return np.sum(q**k) - 1.0
-
-    try:
-        k = brentq(f, 0.2, 3.0, xtol=1e-10, maxiter=200)
-    except ValueError:
-        return q / s
-    p = q**k
-    return p / p.sum()
+ESITI_1X2 = {"1", "X", "2"}
+ESITI_ALTRI = {"O25", "U25", "GG", "1X", "X2", "12"}
 
 
-def kelly_frac(p, odds, cap=0.05):
-    """Kelly frazionario con cap."""
-    if p <= 0 or p >= 1 or odds <= 1:
-        return 0.0
-    b = odds - 1.0
-    f = (p * b - (1.0 - p)) / b
-    return min(max(f, 0.0), cap)
+# ------------------------------------------------------------------ database
+def db():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
 
-def ev_calc(p, odds):
-    """Expected value per unità di stake."""
-    return p * odds - 1.0
-
-
-# ========== DATABASE ==========
-class DB:
-    def __init__(self, path=DB_PATH):
-        self.path = path
-        self._init()
-
-    def _init(self):
-        conn = sqlite3.connect(self.path)
-        c = conn.cursor()
-        c.execute(
+def init_db():
+    with db() as c:
+        c.executescript(
             """
-            CREATE TABLE IF NOT EXISTS partite (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                data TEXT,
-                squadre TEXT,
-                stato TEXT DEFAULT 'aperta'
-            )
-        """
-        )
-        c.execute(
+            CREATE TABLE IF NOT EXISTS utenti (
+                uid INTEGER PRIMARY KEY,
+                capitale REAL,
+                creato TEXT
+            );
+            CREATE TABLE IF NOT EXISTS giocate (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid INTEGER, data TEXT, lega TEXT, partita TEXT,
+                esito TEXT, quota REAL, quota_equa REAL,
+                p_mercato REAL, p_modello REAL, ev REAL,
+                stake REAL, stato TEXT DEFAULT 'aperta', pnl REAL DEFAULT 0
+            );
             """
-            CREATE TABLE IF NOT EXISTS quote (
-                id INTEGER PRIMARY KEY,
-                partita_id INTEGER,
-                mercato TEXT,
-                book TEXT,
-                quota REAL,
-                FOREIGN KEY(partita_id) REFERENCES partite(id)
-            )
-        """
         )
+
+
+def utente(uid):
+    with db() as c:
+        r = c.execute("SELECT * FROM utenti WHERE uid=?", (uid,)).fetchone()
+        if r:
+            return dict(r)
         c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scalate (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER,
-                partita_id INTEGER,
-                mercato TEXT,
-                stake REAL,
-                target REAL,
-                quote TEXT,
-                data TEXT,
-                stato TEXT DEFAULT 'in corso',
-                risultato TEXT,
-                pnl REAL,
-                clv REAL
-            )
-        """
+            "INSERT INTO utenti (uid, capitale, creato) VALUES (?,?,?)",
+            (uid, CAPITALE_DEFAULT, datetime.now().isoformat()),
         )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS stato_utente (
-                user_id INTEGER PRIMARY KEY,
-                capitale REAL DEFAULT {},
-                totale_scalate INTEGER DEFAULT 0,
-                vinte INTEGER DEFAULT 0,
-                profitto REAL DEFAULT 0,
-                ultima_aggiornamento TEXT
-            )
-        """.format(
-                CAPITALE_INIZIALE
-            )
-        )
-        conn.commit()
-        conn.close()
-
-    def conn_ctx(self):
-        return sqlite3.connect(self.path)
-
-    def get_user_state(self, user_id):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute("SELECT capitale, totale_scalate, vinte, profitto FROM stato_utente WHERE user_id=?", (user_id,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            return {"capitale": row[0], "scalate": row[1], "vinte": row[2], "profitto": row[3]}
-        return {"capitale": CAPITALE_INIZIALE, "scalate": 0, "vinte": 0, "profitto": 0}
-
-    def save_user_state(self, user_id, capitale, scalate, vinte, profitto):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT OR REPLACE INTO stato_utente (user_id, capitale, totale_scalate, vinte, profitto, ultima_aggiornamento)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """,
-            (user_id, capitale, scalate, vinte, profitto, datetime.now().isoformat()),
-        )
-        conn.commit()
-        conn.close()
-
-    def add_partita(self, user_id, squadre):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO partite (user_id, squadre, data) VALUES (?, ?, ?)",
-            (user_id, squadre, datetime.now().isoformat()),
-        )
-        pid = c.lastrowid
-        conn.commit()
-        conn.close()
-        return pid
-
-    def add_quote(self, partita_id, mercato, book, quota):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO quote (partita_id, mercato, book, quota) VALUES (?, ?, ?, ?)",
-            (partita_id, mercato, book, quota),
-        )
-        conn.commit()
-        conn.close()
-
-    def get_partita_quote(self, partita_id):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute("SELECT mercato, book, quota FROM quote WHERE partita_id=? ORDER BY mercato", (partita_id,))
-        rows = c.fetchall()
-        conn.close()
-        out = {}
-        for m, b, q in rows:
-            if m not in out:
-                out[m] = {}
-            out[m][b] = q
-        return out
-
-    def add_scalata(self, user_id, partita_id, mercato, stake, target, quote_list, clv):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO scalate (user_id, partita_id, mercato, stake, target, quote, clv, data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (user_id, partita_id, mercato, stake, target, json.dumps(quote_list), clv, datetime.now().isoformat()),
-        )
-        sid = c.lastrowid
-        conn.commit()
-        conn.close()
-        return sid
-
-    def update_scalata_result(self, scalata_id, vinta, pnl):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute(
-            "UPDATE scalate SET stato=?, risultato=?, pnl=? WHERE id=?",
-            ("vinta" if vinta else "persa", "vinto" if vinta else "perso", pnl, scalata_id),
-        )
-        conn.commit()
-        conn.close()
-
-    def get_user_scalate(self, user_id, limit=10):
-        conn = self.conn_ctx()
-        c = conn.cursor()
-        c.execute(
-            "SELECT id, mercato, stake, target, quote, stato, pnl, clv FROM scalate WHERE user_id=? ORDER BY id DESC LIMIT ?",
-            (user_id, limit),
-        )
-        rows = c.fetchall()
-        conn.close()
-        return rows
+        return {"uid": uid, "capitale": CAPITALE_DEFAULT}
 
 
-db = DB()
-
-# ========== HANDLERS ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inizia il bot."""
-    user_id = update.effective_user.id
-    state = db.get_user_state(user_id)
-    msg = f"""
-Benvenuto in Prediction_Bot.
-
-Questo è un laboratorio di value betting: inserisci le quote, il sistema calcola le scalate, tu decidi se giocare.
-
-**Capitale:** €{state['capitale']:.0f}
-**Scalate:** {state['scalate']} (vinte: {state['vinte']})
-**Profitto:** €{state['profitto']:+.0f}
-
-Comandi:
-/valuta — analizza una nuova partita
-/stato — vedi statistiche
-/risultato — registra l'esito di una scalata
-/reset — ricomincia
-
-⚠️ Ricorda: −12% EV sulle scalate a 3 step. È un esperimento.
-"""
-    await update.message.reply_text(msg)
+# ------------------------------------------------------------------ formato
+def pct(x):
+    return "n/d" if x is None else f"{x*100:.1f}%"
 
 
-async def valuta_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inizia la valutazione di una partita."""
-    await update.message.reply_text("Come si chiama la partita? (es: Napoli-Roma)")
-    return ATTESA_PARTITA
+def riga_partita(p):
+    quando = p["data"].strftime("%d/%m") if p["data"] is not None else "?"
+    ora = f" {p['ora']}" if p["ora"] and p["ora"] != "nan" else ""
+    testa = f"*{p['n']}.* {p['casa']} – {p['trasferta']}\n    {quando}{ora} · {p['lega']}"
+
+    if p["p_mercato"]:
+        m = p["p_mercato"]
+        testa += f"\n    mercato  1 {pct(m['1'])} · X {pct(m['X'])} · 2 {pct(m['2'])}"
+    else:
+        testa += "\n    mercato  quote non ancora disponibili"
+
+    if p["modello"]:
+        mo = p["modello"]
+        testa += f"\n    modello  1 {pct(mo['1'])} · X {pct(mo['X'])} · 2 {pct(mo['2'])}"
+        if p["scarto"] is not None and p["scarto"] > 0.05:
+            testa += f"\n    ⚠ disaccordo {p['scarto']*100:.0f} punti sull'esito {p['esito_scarto']}"
+    else:
+        testa += "\n    modello  squadra senza storico sufficiente"
+    return testa
 
 
-async def valuta_partita(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ricevi il nome della partita."""
-    user_id = update.effective_user.id
-    squadre = update.message.text.strip()
-    partita_id = db.add_partita(user_id, squadre)
-    context.user_data["partita_id"] = partita_id
-    context.user_data["quote"] = {}
-
-    msg = (
-        f"Partita: {squadre}\n\n"
-        "Inserisci la quota per il **1** (vittoria casa).\n"
-        "Formato: 2.45 o 2,45"
+# ------------------------------------------------------------------ comandi
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = utente(update.effective_user.id)
+    await update.message.reply_text(
+        "*Prediction\\_Bot*\n\n"
+        "Il bot scarica le partite di Serie A e Premier League, le analizza "
+        "e le confronta con Betfair Exchange. Tu mandi le quote di Sisal, "
+        "lui ti dice se c'è valore.\n\n"
+        f"Capitale: *€{u['capitale']:.0f}*\n\n"
+        "*Comandi*\n"
+        "/oggi — partite analizzate\n"
+        "/stato — bankroll e storico\n"
+        "/reset — azzera il conto\n\n"
+        "*Per inserire una quota* basta un messaggio:\n"
+        "`3 2.45 3.20 1.80` → partita 3, quote 1/X/2\n"
+        "`3 1 2.45` → solo l'esito 1\n"
+        "`3 O25 1.85` → Over 2.5\n\n"
+        "_Il backtest dice −12% EV per scalata a 3 step. È un laboratorio, "
+        "non una fonte di reddito._",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    await update.message.reply_text(msg)
-    return ATTESA_QUOTE_H
 
 
-async def quote_h(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def oggi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    avviso = await update.message.reply_text(
+        "Scarico risultati e quote, stimo il modello… (30-60 secondi la prima volta)"
+    )
     try:
-        q = float(update.message.text.replace(",", "."))
-        if q < 1.01:
-            raise ValueError
-        context.user_data["quote"]["H"] = q
-        db.add_quote(context.user_data["partita_id"], "1X2", "sisal", q)
-    except ValueError:
-        await update.message.reply_text("Quota non valida. Riprova (es: 2.45)")
-        return ATTESA_QUOTE_H
+        import asyncio
 
-    await update.message.reply_text("Quota per il **pareggio** (X)?")
-    return ATTESA_QUOTE_D
+        loop = asyncio.get_running_loop()
+        a = await loop.run_in_executor(None, E.aggiorna)
+    except Exception as e:
+        log.exception("aggiorna")
+        await avviso.edit_text(f"Errore durante l'aggiornamento:\n`{e}`",
+                               parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if a.errore and a.modello is None:
+        await avviso.edit_text(f"Non sono riuscito a scaricare i dati:\n`{a.errore}`",
+                               parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if not a.partite:
+        await avviso.edit_text(
+            "Nessuna partita di Serie A o Premier League nel file delle prossime gare.\n\n"
+            "Il file viene aggiornato il venerdì pomeriggio per il weekend e il "
+            "martedì per i turni infrasettimanali. Se i campionati sono fermi, "
+            "è normale che sia vuoto."
+        )
+        return
+
+    ctx.bot_data["partite"] = {p["n"]: p for p in a.partite}
+    blocchi = [riga_partita(p) for p in a.partite[:15]]
+    testa = (
+        f"*{len(a.partite)} partite in programma*\n"
+        f"_riferimento: Betfair Exchange · modello su {a.modello.n_partite} partite_\n\n"
+    )
+    coda = (
+        "\n\n_Manda il numero della partita e le quote di Sisal._\n"
+        "_Esempio:_ `1 2.45 3.20 1.80`"
+    )
+    await avviso.edit_text(testa + "\n\n".join(blocchi) + coda,
+                           parse_mode=ParseMode.MARKDOWN)
 
 
-async def quote_d(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Interpreta un messaggio di quote in una riga."""
+    testo = update.message.text.strip()
+    pezzi = testo.replace(",", ".").split()
+    partite = ctx.bot_data.get("partite")
+
+    if not partite:
+        await update.message.reply_text("Prima manda /oggi per caricare le partite.")
+        return
+
     try:
-        q = float(update.message.text.replace(",", "."))
-        if q < 1.01:
-            raise ValueError
-        context.user_data["quote"]["D"] = q
-        db.add_quote(context.user_data["partita_id"], "1X2", "sisal", q)
-    except ValueError:
-        await update.message.reply_text("Quota non valida. Riprova.")
-        return ATTESA_QUOTE_D
+        n = int(pezzi[0])
+    except (ValueError, IndexError):
+        await update.message.reply_text(
+            "Non ho capito. Formato: `3 2.45 3.20 1.80`", parse_mode=ParseMode.MARKDOWN
+        )
+        return
 
-    await update.message.reply_text("Quota per il **2** (vittoria trasferta)?")
-    return ATTESA_QUOTE_A
+    p = partite.get(n)
+    if not p:
+        await update.message.reply_text(f"La partita {n} non esiste. Controlla con /oggi.")
+        return
 
-
-async def quote_a(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = float(update.message.text.replace(",", "."))
-        if q < 1.01:
-            raise ValueError
-        context.user_data["quote"]["A"] = q
-        db.add_quote(context.user_data["partita_id"], "1X2", "sisal", q)
-    except ValueError:
-        await update.message.reply_text("Quota non valida. Riprova.")
-        return ATTESA_QUOTE_A
-
-    await update.message.reply_text("Quota per **Over 2.5**? (premi 0 per saltare)")
-    return ATTESA_QUOTE_O25
-
-
-async def quote_o25(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = update.message.text.strip()
-        if val == "0":
-            context.user_data["quote"]["O25"] = None
-        else:
-            q = float(val.replace(",", "."))
-            if q < 1.01:
-                raise ValueError
-            context.user_data["quote"]["O25"] = q
-            db.add_quote(context.user_data["partita_id"], "Over2.5", "sisal", q)
-    except ValueError:
-        await update.message.reply_text("Non valido. Riprova o scrivi 0.")
-        return ATTESA_QUOTE_O25
-
-    await update.message.reply_text("Quota per **BTTS** (entrambe segnano)? (0 per saltare)")
-    return ATTESA_QUOTE_BTTS
-
-
-async def quote_btts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = update.message.text.strip()
-        if val == "0":
-            context.user_data["quote"]["BTTS"] = None
-        else:
-            q = float(val.replace(",", "."))
-            if q < 1.01:
-                raise ValueError
-            context.user_data["quote"]["BTTS"] = q
-            db.add_quote(context.user_data["partita_id"], "BTTS", "sisal", q)
-    except ValueError:
-        await update.message.reply_text("Non valido. Riprova o scrivi 0.")
-        return ATTESA_QUOTE_BTTS
-
-    # calcola e proponi scalate
-    await calcola_scalate(update, context)
-    return ConversationHandler.END
-
-
-async def calcola_scalate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Calcola e propone le scalate."""
-    q_dict = context.user_data["quote"]
-    user_state = db.get_user_state(update.effective_user.id)
-    capitale = user_state["capitale"]
-
-    # 1X2
-    q_1x2 = [q_dict["H"], q_dict["D"], q_dict["A"]]
-    p_sharp = devig_power(q_1x2)
-
-    msg = "**ANALISI 1X2**\n\n"
-    for label, prob in zip(["1", "X", "2"], p_sharp):
-        msg += f"{label}: {prob*100:.1f}%  quota sharp {1/prob:.2f}\n"
-
-    # Calcola scalate per ogni esito
-    scalate_proposte = []
-    for i, label in enumerate(["1", "X", "2"]):
-        p = p_sharp[i]
-        odds = q_1x2[i]
-        ev_base = ev_calc(p, odds)
-        clv_val = odds * p - 1.0
-
-        if ev_base > 0.02:  # soglia minima EV
-            for stake_pct in [0.05, 0.10, 0.15]:
-                stake = capitale * stake_pct
-                if stake < 10:
-                    continue
-                target = stake * (odds**3)
-                if target > capitale * 2:
-                    continue
-                scalate_proposte.append({
-                    "mercato": f"1X2-{label}",
-                    "stake": stake,
-                    "target": target,
-                    "quote": [odds] * 3,
-                    "clv": clv_val,
-                    "ev": ev_base,
-                })
-
-    if scalate_proposte:
-        msg += "\n**SCALATE A 3 STEP PROPOSTE**\n\n"
-        for i, s in enumerate(sorted(scalate_proposte, key=lambda x: x["clv"], reverse=True)[:3]):
-            msg += (
-                f"{i+1}. {s['mercato']}\n"
-                f"   Stake: €{s['stake']:.0f} → target €{s['target']:.0f}\n"
-                f"   EV: {s['ev']*100:+.1f}%  CLV: {s['clv']*100:+.1f}%\n\n"
+    # forma lunga: numero + tre quote 1X2
+    if len(pezzi) == 4 and all(re.fullmatch(r"\d+(\.\d+)?", x) for x in pezzi[1:]):
+        richieste = list(zip(("1", "X", "2"), (float(x) for x in pezzi[1:])))
+    # forma corta: numero + esito + quota
+    elif len(pezzi) == 3:
+        es = pezzi[1].upper()
+        if es not in ESITI_1X2 | ESITI_ALTRI:
+            await update.message.reply_text(
+                f"Esito `{pezzi[1]}` non riconosciuto.\n"
+                f"Validi: 1, X, 2, O25, U25, GG, 1X, X2, 12",
+                parse_mode=ParseMode.MARKDOWN,
             )
-        context.user_data["scalate_proposte"] = scalate_proposte
+            return
+        try:
+            richieste = [(es, float(pezzi[2]))]
+        except ValueError:
+            await update.message.reply_text("La quota non è un numero valido.")
+            return
     else:
-        msg += "\nNessuna scalata con EV positivo."
+        await update.message.reply_text(
+            "Formato non valido.\n`3 2.45 3.20 1.80` oppure `3 1 2.45`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
-    msg += f"\n_Capitale disponibile: €{capitale:.0f}_"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    u = utente(update.effective_user.id)
+    righe = [f"*{p['casa']} – {p['trasferta']}*  ({p['lega']})\n"]
+    migliore = None
+
+    for esito, q in richieste:
+        if q <= 1.0:
+            righe.append(f"`{esito}` quota {q} non valida.")
+            continue
+        r = E.analizza_quota(p, esito, q)
+
+        if r["p_mercato"] is None:
+            righe.append(
+                f"*{esito}* · quota {q:.2f}\n"
+                f"    nessuna linea di riferimento per questo mercato"
+            )
+            continue
+
+        segno = "✅" if r["ev_mercato"] > 0.02 else ("○" if r["ev_mercato"] > 0 else "✗")
+        blocco = (
+            f"{segno} *{esito}* · Sisal {q:.2f}\n"
+            f"    quota equa {r['quota_equa']:.2f} · mercato {pct(r['p_mercato'])}\n"
+            f"    *EV {r['ev_mercato']*100:+.2f}%*"
+        )
+        if r["p_modello"] is not None:
+            blocco += f"\n    modello {pct(r['p_modello'])} (EV {r['ev_modello']*100:+.1f}%)"
+        righe.append(blocco)
+
+        if migliore is None or r["ev_mercato"] > migliore[1]["ev_mercato"]:
+            migliore = (esito, r)
+
+    if migliore and migliore[1]["ev_mercato"] > 0.02:
+        e2, r2 = migliore
+        stake = min(u["capitale"] * 0.05, u["capitale"])
+        s = E.scalata(
+            [r2["p_mercato"]] * 3, [r2["quota"]] * 3, stake
+        )
+        righe.append(
+            f"\n*Scalata a 3 step su {e2}*\n"
+            f"    €{stake:.0f} → €{s['target']:.0f}\n"
+            f"    probabilità di completarla *{s['p_completamento']*100:.1f}%*\n"
+            f"    EV complessivo *{s['ev_pct']*100:+.1f}%*"
+        )
+        if s["ev_pct"] < 0:
+            righe.append(
+                "    _EV negativo: il margine si compone su tre step e "
+                "si mangia il vantaggio del singolo._"
+            )
+    elif migliore:
+        righe.append("\n_Nessun esito con valore sufficiente. Meglio lasciar stare._")
+
+    await update.message.reply_text("\n\n".join(righe), parse_mode=ParseMode.MARKDOWN)
 
 
-async def stato(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mostra lo stato del conto."""
-    user_id = update.effective_user.id
-    state = db.get_user_state(user_id)
+async def stato(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = utente(uid)
+    with db() as c:
+        g = c.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(pnl),0) pnl, COALESCE(AVG(ev),0) ev "
+            "FROM giocate WHERE uid=?",
+            (uid,),
+        ).fetchone()
 
-    msg = f"""
-**STATO CONTO**
-
-Capitale: €{state['capitale']:.0f}
-Scalate totali: {state['scalate']}
-Vinte: {state['vinte']}
-Win rate: {state['scalate'] > 0 and (state['vinte']*100/state['scalate']):.0f or 0}%
-Profitto netto: €{state['profitto']:+.0f}
-
----
-
-Le ultime 5 scalate:
-"""
-
-    scalate = db.get_user_scalate(user_id, limit=5)
-    if scalate:
-        for sid, merc, stake, target, quote_str, stato_s, pnl, clv in scalate:
-            stato_emoji = "✓" if stato_s == "vinta" else "✗" if stato_s == "persa" else "⏳"
-            msg += f"\n{stato_emoji} {merc} · stake €{stake:.0f} → €{target:.0f}"
-            if pnl:
-                msg += f" · {pnl:+.0f}"
-    else:
-        msg += "\n(nessuna ancora)"
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(
+        f"*Conto*\n\n"
+        f"Capitale: €{u['capitale']:.2f}\n"
+        f"Giocate registrate: {g['n']}\n"
+        f"P/L: €{g['pnl']:+.2f}\n"
+        f"EV medio all'inserimento: {g['ev']*100:+.2f}%\n\n"
+        "_Con pochi dati il P/L è quasi tutto rumore. "
+        "Il numero da guardare, quando ce ne saranno abbastanza, è il CLV._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset conto."""
-    user_id = update.effective_user.id
-    db.save_user_state(user_id, CAPITALE_INIZIALE, 0, 0, 0)
-    await update.message.reply_text(f"✓ Conto resettato. Capitale: €{CAPITALE_INIZIALE:.0f}")
+async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    with db() as c:
+        c.execute("DELETE FROM giocate WHERE uid=?", (uid,))
+        c.execute("UPDATE utenti SET capitale=? WHERE uid=?", (CAPITALE_DEFAULT, uid))
+    await update.message.reply_text(f"Conto azzerato. Capitale €{CAPITALE_DEFAULT:.0f}.")
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors."""
-    print(f"Update {update} caused error {context.error}")
+async def errore(update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("errore non gestito", exc_info=ctx.error)
 
 
-# ========== MAIN ==========
 def main():
+    if not TOKEN:
+        raise SystemExit("Manca la variabile TELEGRAM_TOKEN")
+    init_db()
+
     app = Application.builder().token(TOKEN).build()
-
-    conv_valuta = ConversationHandler(
-        entry_points=[CommandHandler("valuta", valuta_start)],
-        states={
-            ATTESA_PARTITA: [MessageHandler(filters.TEXT & ~filters.COMMAND, valuta_partita)],
-            ATTESA_QUOTE_H: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_h)],
-            ATTESA_QUOTE_D: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_d)],
-            ATTESA_QUOTE_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_a)],
-            ATTESA_QUOTE_O25: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_o25)],
-            ATTESA_QUOTE_BTTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_btts)],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-    )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_valuta)
+    app.add_handler(CommandHandler("oggi", oggi))
     app.add_handler(CommandHandler("stato", stato))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_error_handler(error_handler)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, quote))
+    app.add_error_handler(errore)
 
-    print("Bot in ascolto...")
-    app.run_polling()
+    log.info("bot avviato")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
